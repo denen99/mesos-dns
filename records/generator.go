@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"regexp"
 
 	"github.com/mesosphere/mesos-dns/errorutil"
 	"github.com/mesosphere/mesos-dns/logging"
@@ -286,8 +287,25 @@ func (rg *RecordGenerator) InsertState(sj state.State, domain, ns, listener stri
 	rg.listenerRecord(listener, ns)
 	rg.masterRecord(domain, masters, sj.Leader)
 	rg.taskRecords(sj, domain, spec, ipSources)
-
+        rg.vipRecords(sj,domain,spec)
 	return nil
+}
+
+
+func (rg *RecordGenerator) vipRecords(sj state.State, domain string, spec labels.Func) {
+	re := regexp.MustCompile("^VIP")
+
+	for _, f := range sj.Frameworks {
+           for _, t := range f.Tasks {
+	  	for _, p := range t.DiscoveryInfo.Ports.DiscoveryPorts {
+		  for _, l := range p.Labels.Labels {
+	             if (re.MatchString(l.Key)) {
+			     rg.insertRR("VIP", l.Value, A)
+		     }
+		  }
+	        }
+	   }
+	}
 }
 
 // frameworkRecords injects A and SRV records into the generator store:
