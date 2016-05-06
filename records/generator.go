@@ -300,7 +300,13 @@ func (rg *RecordGenerator) vipRecords(sj state.State, domain string, spec labels
 	  	for _, p := range t.DiscoveryInfo.Ports.DiscoveryPorts {
 		  for _, l := range p.Labels.Labels {
 	             if (re.MatchString(l.Key)) {
-			     rg.insertRR("VIP", l.Value, A)
+			     parts := strings.Split(l.Key,":")
+			     ip := parts[0]
+			     port := parts[1]
+			     a := "_vip._" + t.Name + "._" + p.Protocol + "." + domain + "."
+			     rg.insertRR(a,ip,A)
+			     srvAddress := net.JoinHostPort(a,port)
+			     rg.insertRR(a,srvAddress, SRV)
 		     }
 		  }
 	        }
