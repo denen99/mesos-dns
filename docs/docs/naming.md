@@ -102,10 +102,12 @@ The following table illustrates the rules that govern SRV generation:
 ## Other Records
 
 Mesos-DNS generates a few special records:
+
 - for the leading master: A record (`leader.domain`) and SRV records (`_leader._tcp.domain` and `_leader._udp.domain`); and
 - for all framework schedulers: A records (`{framework}.domain`) and SRV records (`_framework._tcp.{framework}.domain`)
 - for every known Mesos master: A records (`master.domain`) and SRV records (`_master._tcp.domain` and `_master._udp.domain`); and
 - for every known Mesos slave: A records (`slave.domain`) and SRV records (`_slave._tcp.domain`).
+- for every VIP , a SRV record of the format (`_vip-{task}._protocol.framework.domain`) that points to the A Record of the host (`vip-task.framework.domain`)
 
 Note that, if you configure Mesos-DNS to detect the leading master through Zookeeper, then this is the only master it knows about.
 If you configure Mesos-DNS using the `masters` field, it will generate master records for every master in the list.
