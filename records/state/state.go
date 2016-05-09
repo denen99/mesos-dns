@@ -264,4 +264,7 @@ type DiscoveryPort struct {
 	Protocol string `json:"protocol"`
 	Number   int    `json:"number"`
 	Name     string `json:"name"`
+	Labels      struct {
+			    Labels []Label `json:"labels"`
+		    } `json:"labels"`
 }
