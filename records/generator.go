@@ -287,7 +287,7 @@ func (rg *RecordGenerator) InsertState(sj state.State, domain, ns, listener stri
 	rg.listenerRecord(listener, ns)
 	rg.masterRecord(domain, masters, sj.Leader)
 	rg.taskRecords(sj, domain, spec, ipSources)
-        rg.vipRecords(sj,domain,spec)
+        rg.vipRecords(sj,domain, spec)
 	return nil
 }
 
@@ -296,17 +296,20 @@ func (rg *RecordGenerator) vipRecords(sj state.State, domain string, spec labels
 	re := regexp.MustCompile("^VIP")
 
 	for _, f := range sj.Frameworks {
+	   fname := labels.DomainFrag(f.Name, labels.Sep, spec)
+	   tail := "." + fname + "." + domain + "."
            for _, t := range f.Tasks {
 	  	for _, p := range t.DiscoveryInfo.Ports.DiscoveryPorts {
 		  for _, l := range p.Labels.Labels {
 	             if (re.MatchString(l.Key)) {
-			     parts := strings.Split(l.Key,":")
+			     parts := strings.Split(l.Value,":")
 			     ip := parts[0]
 			     port := parts[1]
-			     a := "_vip._" + t.Name + "._" + p.Protocol + "." + domain + "."
-			     rg.insertRR(a,ip,A)
-			     srvAddress := net.JoinHostPort(a,port)
-			     rg.insertRR(a,srvAddress, SRV)
+			     vip := "vip-" + t.Name + tail
+			     rg.insertRR(vip,ip,A)
+			     srvAddress := net.JoinHostPort(vip,port)
+			     srvName := "_vip-" + t.Name + "._" + p.Protocol +  tail
+			     rg.insertRR(srvName,srvAddress, SRV)
 		     }
 		  }
 	        }

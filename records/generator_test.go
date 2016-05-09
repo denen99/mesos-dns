@@ -268,6 +268,9 @@ func TestInsertState(t *testing.T) {
 		{rgDocker.As, "liquor-store.marathon.slave.mesos.", []string{"1.2.3.11", "1.2.3.12"}},
 		{rgDocker.As, "nginx.marathon.mesos.", []string{"1.2.3.11"}},
 		{rgDocker.As, "car-store.marathon.slave.mesos.", []string{"1.2.3.11"}},
+
+		{rg.As, "vip-liquor.store.marathon.mesos.",[]string{"10.10.10.10"}},
+		{rg.SRVs, "_vip-liquor.store._tcp.marathon.mesos.", []string{"vip-liquor.store.marathon.mesos.:8000"}},
 	} {
 		// convert want into a map[string]struct{} (string set) for simpler comparison
 		// via reflect.DeepEqual
