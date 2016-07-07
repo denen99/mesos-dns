@@ -17,6 +17,7 @@ import (
 	_ "github.com/mesos/mesos-go/detector/zoo" // Registers the ZK detector
 	"github.com/mesosphere/mesos-dns/exchanger"
 	"github.com/mesosphere/mesos-dns/logging"
+	"github.com/mesosphere/mesos-dns/models"
 	"github.com/mesosphere/mesos-dns/records"
 	"github.com/mesosphere/mesos-dns/util"
 	"github.com/miekg/dns"
@@ -24,27 +25,31 @@ import (
 
 // Resolver holds configuration state and the resource records
 type Resolver struct {
-	masters []string
-	version string
-	config  records.Config
-	rs      *records.RecordGenerator
-	rsLock  sync.RWMutex
-	rng     *rand.Rand
-	fwd     exchanger.Forwarder
+	masters          []string
+	version          string
+	config           records.Config
+	rs               *records.RecordGenerator
+	rsLock           sync.RWMutex
+	rng              *rand.Rand
+	fwd              exchanger.Forwarder
+	generatorOptions []records.Option
 }
 
 // New returns a Resolver with the given version and configuration.
 func New(version string, config records.Config) *Resolver {
-	var recordGenerator *records.RecordGenerator
-	recordGenerator = records.NewRecordGenerator(time.Duration(config.StateTimeoutSeconds) * time.Second)
+	generatorOptions := []records.Option{
+		records.WithConfig(config),
+	}
+	recordGenerator := records.NewRecordGenerator(generatorOptions...)
 	r := &Resolver{
 		version: version,
 		config:  config,
 		rs:      recordGenerator,
 		// rand.Sources aren't safe for concurrent use, except the global one.
 		// See: https://github.com/golang/go/issues/3611
-		rng:     rand.New(&lockedSource{src: rand.NewSource(time.Now().UnixNano())}),
-		masters: append([]string{""}, config.Masters...),
+		rng:              rand.New(&lockedSource{src: rand.NewSource(time.Now().UnixNano())}),
+		masters:          append([]string{""}, config.Masters...),
+		generatorOptions: generatorOptions,
 	}
 
 	timeout := 5 * time.Second
@@ -142,7 +147,7 @@ func (res *Resolver) SetMasters(masters []string) {
 // Reload triggers a new state load from the configured mesos masters.
 // This method is not goroutine-safe.
 func (res *Resolver) Reload() {
-	t := records.NewRecordGenerator(time.Duration(res.config.StateTimeoutSeconds) * time.Second)
+	t := records.NewRecordGenerator(res.generatorOptions...)
 	err := t.ParseState(res.config, res.masters...)
 
 	if err == nil {
@@ -475,6 +480,7 @@ func (res *Resolver) configureHTTP() {
 	ws.Route(ws.GET("/v1/services/{service}").To(res.RestService))
 	if res.config.EnumerationOn {
 		ws.Route(ws.GET("/v1/enumerate").To(res.RestEnumerate))
+		ws.Route(ws.GET("/v1/axfr").To(res.RestAXFR))
 	}
 	restful.Add(ws)
 }
@@ -485,14 +491,14 @@ func (res *Resolver) LaunchHTTP() <-chan error {
 	defer util.HandleCrash()
 
 	res.configureHTTP()
-	portString := ":" + strconv.Itoa(res.config.HTTPPort)
+	listenAddress := net.JoinHostPort(res.config.HTTPListener, strconv.Itoa(res.config.HTTPPort))
 
 	errCh := make(chan error, 1)
 	go func() {
 		var err error
 		defer func() { errCh <- err }()
 
-		if err = http.ListenAndServe(portString, nil); err != nil {
+		if err = http.ListenAndServe(listenAddress, nil); err != nil {
 			err = fmt.Errorf("Failed to setup http server: %v", err)
 		} else {
 			logging.Error.Println("Not serving http requests any more.")
@@ -513,6 +519,29 @@ func (res *Resolver) RestEnumerate(req *restful.Request, resp *restful.Response)
 
 	enumData := res.records().EnumData
 	if err := resp.WriteAsJson(enumData); err != nil {
+		logging.Error.Println(err)
+	}
+}
+
+// RestAXFR handles HTTP requests to turn the zone into a transferable format
+func (res *Resolver) RestAXFR(req *restful.Request, resp *restful.Response) {
+	records := res.records()
+
+	AXFRRecords := models.AXFRRecords{
+		SRVs: records.SRVs.ToAXFRResourceRecordSet(),
+		As:   records.As.ToAXFRResourceRecordSet(),
+	}
+	AXFR := models.AXFR{
+		Records:        AXFRRecords,
+		Serial:         atomic.LoadUint32(&res.config.SOASerial),
+		Mname:          res.config.SOAMname,
+		Rname:          res.config.SOARname,
+		TTL:            res.config.TTL,
+		RefreshSeconds: res.config.RefreshSeconds,
+		Domain:         res.config.Domain,
+	}
+
+	if err := resp.WriteAsJson(AXFR); err != nil {
 		logging.Error.Println(err)
 	}
 }
