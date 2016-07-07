@@ -11,7 +11,6 @@ import (
 	"reflect"
 	"testing"
 	"testing/quick"
-	"time"
 
 	"github.com/mesosphere/mesos-dns/logging"
 	"github.com/mesosphere/mesos-dns/records/labels"
@@ -25,8 +24,8 @@ func init() {
 }
 
 func (rg *RecordGenerator) exists(name, host string, kind rrsKind) bool {
-	rrs := kind.rrs(rg)
-	if val, ok := rrs[name]; ok {
+	rrsByKind := kind.rrs(rg)
+	if val, ok := rrsByKind[name]; ok {
 		_, ok := val[host]
 		return ok
 	}
@@ -342,7 +341,7 @@ func TestTimeout(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(sleepForeverHandler))
 	defer server.Close()
 
-	rg := NewRecordGenerator(500 * time.Millisecond)
+	rg := NewRecordGenerator(WithConfig(Config{StateTimeoutSeconds: 1}))
 	host, port, err := net.SplitHostPort(server.Listener.Addr().String())
 	_, err = rg.loadFromMaster(host, port)
 	if err == nil {

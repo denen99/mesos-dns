@@ -17,15 +17,20 @@ import (
 	"regexp"
 
 	"github.com/mesosphere/mesos-dns/errorutil"
+	"github.com/mesosphere/mesos-dns/httpcli"
 	"github.com/mesosphere/mesos-dns/logging"
+	"github.com/mesosphere/mesos-dns/models"
 	"github.com/mesosphere/mesos-dns/records/labels"
 	"github.com/mesosphere/mesos-dns/records/state"
+	"github.com/mesosphere/mesos-dns/urls"
 	"github.com/tv42/zbase32"
 )
 
 // Map host/service name to DNS answer
 // REFACTOR - when discoveryinfo is integrated
 // Will likely become map[string][]discoveryinfo
+// Effectively we're (ab)using the map type as a set
+// It used to have the type: rrs map[string][]string
 type rrs map[string]map[string]struct{}
 
 func (r rrs) add(name, host string) bool {
@@ -54,6 +59,18 @@ func (r rrs) First(name string) (string, bool) {
 	return "", false
 }
 
+// Transform the record set into something exportable via the REST API
+func (r rrs) ToAXFRResourceRecordSet() models.AXFRResourceRecordSet {
+	ret := make(models.AXFRResourceRecordSet, len(r))
+	for host, values := range r {
+		ret[host] = make([]string, 0, len(values))
+		for record := range values {
+			ret[host] = append(ret[host], record)
+		}
+	}
+	return ret
+}
+
 type rrsKind string
 
 const (
@@ -77,11 +94,12 @@ func (kind rrsKind) rrs(rg *RecordGenerator) rrs {
 // RecordGenerator contains DNS records and methods to access and manipulate
 // them. TODO(kozyraki): Refactor when discovery id is available.
 type RecordGenerator struct {
-	As         rrs
-	SRVs       rrs
-	SlaveIPs   map[string]string
-	EnumData   EnumerationData
-	httpClient http.Client
+	As            rrs
+	SRVs          rrs
+	SlaveIPs      map[string]string
+	EnumData      EnumerationData
+	httpClient    httpcli.Doer
+	stateEndpoint urls.Builder
 }
 
 // EnumerableRecord is the lowest level object, and should map 1:1 with DNS records
@@ -110,9 +128,42 @@ type EnumerationData struct {
 	Frameworks []*EnumerableFramework `json:"frameworks"`
 }
 
+// Option is a functional configuration type that mutates a RecordGenerator
+type Option func(*RecordGenerator)
+
+// WithConfig generates and returns an option that applies some configuration to a RecordGenerator.
+// The internal HTTP transport/client is generated upon invocation of this func so that the returned
+// Option may be reused by generators that want to share the same transport/client.
+func WithConfig(config Config) Option {
+	var (
+		opt, tlsClientConfig = httpcli.TLSConfig(config.MesosHTTPSOn, config.caPool)
+		httpClient           = httpcli.New(
+			config.iamConfig,
+			httpcli.Transport(&http.Transport{
+				DisableKeepAlives:   true, // Mesos master doesn't implement defensive HTTP
+				MaxIdleConnsPerHost: 2,
+				TLSClientConfig:     tlsClientConfig,
+			}),
+			httpcli.Timeout(time.Duration(config.StateTimeoutSeconds)*time.Second),
+		)
+	)
+	return func(rg *RecordGenerator) {
+		rg.httpClient = httpClient
+		rg.stateEndpoint = rg.stateEndpoint.With(
+			urls.Path("/master/state.json"),
+			opt,
+		)
+	}
+}
+
 // NewRecordGenerator returns a RecordGenerator that's been configured with a timeout.
-func NewRecordGenerator(httpTimeout time.Duration) *RecordGenerator {
-	rg := &RecordGenerator{httpClient: http.Client{Timeout: httpTimeout}}
+func NewRecordGenerator(options ...Option) *RecordGenerator {
+	rg := &RecordGenerator{}
+	for i := range options {
+		if options[i] != nil {
+			options[i](rg)
+		}
+	}
 	return rg
 }
 
@@ -182,22 +233,17 @@ func (rg *RecordGenerator) findMaster(masters ...string) (state.State, error) {
 		} else {
 			return sj, nil
 		}
-
 	}
 
 	return sj, errors.New("no master")
 }
 
 // Loads state.json from mesos master
-func (rg *RecordGenerator) loadFromMaster(ip string, port string) (state.State, error) {
+func (rg *RecordGenerator) loadFromMaster(ip, port string) (state.State, error) {
 	// REFACTOR: state.json security
 
 	var sj state.State
-	u := url.URL{
-		Scheme: "http",
-		Host:   net.JoinHostPort(ip, port),
-		Path:   "/master/state.json",
-	}
+	u := url.URL(rg.stateEndpoint.With(urls.Host(net.JoinHostPort(ip, port))))
 
 	req, err := http.NewRequest("GET", u.String(), nil)
 	if err != nil {
@@ -206,6 +252,7 @@ func (rg *RecordGenerator) loadFromMaster(ip string, port string) (state.State, 
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "Mesos-DNS")
 
 	resp, err := rg.httpClient.Do(req)
 	if err != nil {
@@ -233,7 +280,7 @@ func (rg *RecordGenerator) loadFromMaster(ip string, port string) (state.State, 
 // attempts can fail from down server or mesos master secondary
 // it also reloads from a different master if the master it attempted to
 // load from was not the leader
-func (rg *RecordGenerator) loadWrap(ip string, port string) (state.State, error) {
+func (rg *RecordGenerator) loadWrap(ip, port string) (state.State, error) {
 	var err error
 	var sj state.State
 
@@ -394,10 +441,10 @@ func (rg *RecordGenerator) masterRecord(domain string, masters []string, leader 
 		logging.Error.Println(err)
 		return
 	}
-	arec := "leader." + domain + "."
-	rg.insertRR(arec, ip, A)
-	arec = "master." + domain + "."
-	rg.insertRR(arec, ip, A)
+	leaderRecord := "leader." + domain + "."
+	rg.insertRR(leaderRecord, ip, A)
+	allMasterRecord := "master." + domain + "."
+	rg.insertRR(allMasterRecord, ip, A)
 
 	// SRV records
 	tcp := "_leader._tcp." + domain + "."
@@ -418,8 +465,7 @@ func (rg *RecordGenerator) masterRecord(domain string, masters []string, leader 
 
 		// A records (master and masterN)
 		if master != leaderAddress {
-			arec := "master." + domain + "."
-			added := rg.insertRR(arec, masterIP, A)
+			added := rg.insertRR(allMasterRecord, masterIP, A)
 			if !added {
 				// duplicate master?!
 				continue
@@ -431,8 +477,8 @@ func (rg *RecordGenerator) masterRecord(domain string, masters []string, leader 
 			continue
 		}
 
-		arec := "master" + strconv.Itoa(idx) + "." + domain + "."
-		rg.insertRR(arec, masterIP, A)
+		perMasterRecord := "master" + strconv.Itoa(idx) + "." + domain + "."
+		rg.insertRR(perMasterRecord, masterIP, A)
 		idx++
 
 		if master == leaderAddress {
@@ -445,8 +491,8 @@ func (rg *RecordGenerator) masterRecord(domain string, masters []string, leader 
 		if len(masters) > 0 {
 			logging.Error.Printf("warning: leader %q is not in master list", leader)
 		}
-		arec = "master" + strconv.Itoa(idx) + "." + domain + "."
-		rg.insertRR(arec, ip, A)
+		extraMasterRecord := "master" + strconv.Itoa(idx) + "." + domain + "."
+		rg.insertRR(extraMasterRecord, ip, A)
 	}
 }
 
@@ -463,7 +509,10 @@ func (rg *RecordGenerator) listenerRecord(listener string, ns string) {
 
 func (rg *RecordGenerator) taskRecords(sj state.State, domain string, spec labels.Func, ipSources []string) {
 	for _, f := range sj.Frameworks {
-		enumerableFramework := &EnumerableFramework{Name: f.Name}
+		enumerableFramework := &EnumerableFramework{
+			Name:  f.Name,
+			Tasks: []*EnumerableTask{},
+		}
 		rg.EnumData.Frameworks = append(rg.EnumData.Frameworks, enumerableFramework)
 
 		for _, task := range f.Tasks {
@@ -623,8 +672,8 @@ func (rg *RecordGenerator) insertTaskRR(name, host string, kind rrsKind, enumTas
 }
 
 func (rg *RecordGenerator) insertRR(name, host string, kind rrsKind) (added bool) {
-	if rrs := kind.rrs(rg); rrs != nil {
-		if added = rrs.add(name, host); added {
+	if rrsByKind := kind.rrs(rg); rrsByKind != nil {
+		if added = rrsByKind.add(name, host); added {
 			logging.VeryVerbose.Println("[" + string(kind) + "]\t" + name + ": " + host)
 		}
 	}
